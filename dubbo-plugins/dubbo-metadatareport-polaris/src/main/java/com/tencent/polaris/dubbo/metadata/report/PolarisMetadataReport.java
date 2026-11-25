@@ -20,6 +20,7 @@ package com.tencent.polaris.dubbo.metadata.report;
 import com.tencent.polaris.api.core.ConsumerAPI;
 import com.tencent.polaris.api.core.ProviderAPI;
 import com.tencent.polaris.api.exception.PolarisException;
+import com.tencent.polaris.api.exception.ServerCodes;
 import com.tencent.polaris.api.plugin.server.InterfaceDescriptor;
 import com.tencent.polaris.api.plugin.server.ReportServiceContractRequest;
 import com.tencent.polaris.api.pojo.ServiceRule;
@@ -27,6 +28,7 @@ import com.tencent.polaris.api.rpc.GetServiceContractRequest;
 import com.tencent.polaris.api.rpc.ServiceRuleResponse;
 import com.tencent.polaris.api.utils.CollectionUtils;
 import com.tencent.polaris.api.utils.StringUtils;
+import com.tencent.polaris.common.context.Context;
 import com.tencent.polaris.common.config.PolarisConfig;
 import com.tencent.polaris.common.registry.PolarisOperator;
 import com.tencent.polaris.common.registry.PolarisOperators;
@@ -35,7 +37,6 @@ import com.tencent.polaris.specification.api.v1.service.manage.ServiceContractPr
 import java.util.stream.Collectors;
 import org.apache.dubbo.common.URL;
 import org.apache.dubbo.common.config.configcenter.ConfigItem;
-import org.apache.dubbo.common.utils.ConcurrentHashSet;
 import org.apache.dubbo.common.utils.JsonUtils;
 import org.apache.dubbo.common.utils.NamedThreadFactory;
 import org.apache.dubbo.metadata.MappingChangedEvent;
@@ -48,7 +49,7 @@ import org.apache.dubbo.metadata.report.support.AbstractMetadataReport;
 import org.apache.dubbo.metadata.report.support.WrapAbstractMetadataReport;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -66,11 +67,11 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
 
     private final ConsumerAPI consumerAPI;
 
-    private final Map<String, ServiceContractProto.ServiceContract> mappingSubscribes = new ConcurrentHashMap<>();
+    private final Object mappingLock = new Object();
 
-    private final Map<String, ScheduledFuture<?>> mappingFetchTasks = new ConcurrentHashMap<>();
+    private final Map<String, MappingSubscription> mappingSubscriptions = new HashMap<>();
 
-    private final Map<String, Set<MappingListener>> mappingListeners = new ConcurrentHashMap<>();
+    private volatile boolean destroyed;
 
     private final ScheduledExecutorService fetchMappingExecutor = Executors.newScheduledThreadPool(4, new NamedThreadFactory("polaris-metadata-report"));
 
@@ -127,8 +128,8 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
         request.setName(formatAppMetaName(identifier));
         request.setService(identifier.getApplication());
         request.setContent(metadataInfo.getContent());
-        // The name already includes the metadata revision; an instance version can trigger offline cleanup.
-        request.setVersion("");
+        // Keep the existing wire key until instance-version propagation and migration are implemented.
+        request.setVersion(Context.getFromGlobal(Consts.INSTANCE_VERSION, Consts.DEFAULT_VERSION));
         List<InterfaceDescriptor> descriptors = new ArrayList<>(metadataInfo.getServices().size());
         metadataInfo.getServices().forEach((s, serviceInfo) -> {
             InterfaceDescriptor descriptor = new InterfaceDescriptor();
@@ -148,13 +149,27 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
 
     @Override
     public MetadataInfo getAppMetadata(SubscriberMetadataIdentifier identifier, Map<String, String> instanceMetadata) {
-        // 这里由于查询的应用的接口定义数据，这里不能设置 version，必须显示设置 version 为空
         GetServiceContractRequest request = new GetServiceContractRequest();
         request.setName(formatAppMetaName(identifier));
         request.setService(identifier.getApplication());
-        request.setVersion("");
+        String version = Context.getFromGlobal(Consts.INSTANCE_VERSION, Consts.DEFAULT_VERSION);
+        request.setVersion(version);
 
-        Optional<ServiceContractProto.ServiceContract> result = getServiceContract(request);
+        Optional<ServiceContractProto.ServiceContract> result;
+        try {
+            result = queryServiceContract(request);
+            // Read contracts already published by the empty-version implementation, but not on API failures.
+            if (!result.isPresent() && !"".equals(version)) {
+                GetServiceContractRequest compatibilityRequest = new GetServiceContractRequest();
+                compatibilityRequest.setName(formatAppMetaName(identifier));
+                compatibilityRequest.setService(identifier.getApplication());
+                compatibilityRequest.setVersion("");
+                result = queryServiceContract(compatibilityRequest);
+            }
+        } catch (PolarisException e) {
+            logger.error(formatCode(e.getCode()), e.getMessage(), request.toString(), "get app metadata fail");
+            return another.map(proxyReport -> proxyReport.getMetadataReport().getAppMetadata(identifier, instanceMetadata)).orElse(null);
+        }
         if (!result.isPresent()) {
             // 降级，由兜底的 MetadataReport 进行处理
             return another.map(proxyReport -> proxyReport.getMetadataReport().getAppMetadata(identifier, instanceMetadata)).orElse(null);
@@ -202,6 +217,15 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
      * @return {@link Optional<ServiceContractProto.ServiceContract>}
      */
     private Optional<ServiceContractProto.ServiceContract> getServiceContract(GetServiceContractRequest req) {
+        try {
+            return queryServiceContract(req);
+        } catch (PolarisException e) {
+            logger.error(formatCode(e.getCode()), e.getMessage(), req.toString(), "get service_contract fail");
+            return Optional.empty();
+        }
+    }
+
+    private Optional<ServiceContractProto.ServiceContract> queryServiceContract(GetServiceContractRequest req) {
         req.setNamespace(config.getNamespace());
         req.setProtocol(Consts.DUBBO_PROTOCOL);
         try {
@@ -213,14 +237,11 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
             ServiceContractProto.ServiceContract contract = (ServiceContractProto.ServiceContract) rule.getRule();
             return Optional.ofNullable(contract);
         } catch (PolarisException e) {
-            logger.error(
-                    formatCode(e.getCode()),
-                    e.getMessage(),
-                    req.toString(),
-                    "get service_contract fail"
-            );
+            if (e.getServerErrCode() == ServerCodes.NOT_FOUND_RESOURCE) {
+                return Optional.empty();
+            }
+            throw e;
         }
-        return Optional.empty();
     }
 
     /**
@@ -299,10 +320,28 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
 
     @Override
     public void removeServiceAppMappingListener(String serviceKey, MappingListener listener) {
-        Set<MappingListener> listeners = mappingListeners.getOrDefault(serviceKey, Collections.emptySet());
-        listeners.remove(listener);
+        removeServiceAppMappingListener(serviceKey, listener, null);
+    }
 
-        another.ifPresent(proxyReport -> proxyReport.getMetadataReport().removeServiceAppMappingListener(serviceKey, listener));
+    private void removeServiceAppMappingListener(String serviceKey, MappingListener listener, MappingWatch expected) {
+        MappingWatch watch;
+        synchronized (mappingLock) {
+            MappingSubscription subscription = mappingSubscriptions.get(serviceKey);
+            if (subscription == null || (expected != null && subscription.listeners.get(listener) != expected)) {
+                return;
+            }
+            watch = subscription.listeners.remove(listener);
+            if (subscription.listeners.isEmpty()) {
+                mappingSubscriptions.remove(serviceKey);
+                if (subscription.task != null) {
+                    subscription.task.cancel(false);
+                }
+                subscription.initialResult.complete(Optional.empty());
+            }
+        }
+        if (watch != null) {
+            watch.deactivate();
+        }
     }
 
     private static Set<String> getAppNames(ServiceContractProto.ServiceContract contract) {
@@ -323,83 +362,129 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
     @Override
     public Set<String> getServiceAppMapping(String serviceKey, URL url) {
         Set<String> result = commonGetServiceAppMapping(serviceKey, url);
-        if (CollectionUtils.isEmpty(result)) {
+        if (CollectionUtils.isEmpty(result) && !destroyed) {
             return another.map(proxyReport -> proxyReport.getMetadataReport().getServiceAppMapping(serviceKey, url)).orElse(Collections.emptySet());
         }
         return result;
     }
 
     private Set<String> commonGetServiceAppMapping(String serviceKey, URL url) {
-        mappingFetchTasks.computeIfAbsent(serviceKey, s -> {
-            GetServiceContractRequest request = new GetServiceContractRequest();
-            request.setName(formatMappingName(serviceKey));
-            request.setService("");
-            request.setVersion("");
+        MappingSubscription subscription;
+        synchronized (mappingLock) {
+            if (destroyed) {
+                return Collections.emptySet();
+            }
+            subscription = mappingSubscriptions.get(serviceKey);
+            if (subscription != null && subscription.initialResult.isDone()) {
+                return subscription.contract == null ? Collections.emptySet() : getAppNames(subscription.contract);
+            }
+        }
+        Optional<ServiceContractProto.ServiceContract> result = subscription == null
+                ? getMappingContract(serviceKey) : subscription.initialResult.join();
+        return result.map(PolarisMetadataReport::getAppNames).orElse(Collections.emptySet());
+    }
 
-            getServiceContract(request).ifPresent(contract -> mappingSubscribes.put(serviceKey, contract));
-            // Poll even when providers have not published mapping data yet.
-            return fetchMappingExecutor.scheduleAtFixedRate(new FetchMapping(serviceKey, this), 5, 5, TimeUnit.SECONDS);
-        });
-        ServiceContractProto.ServiceContract contract = mappingSubscribes.get(serviceKey);
-        return contract == null ? Collections.emptySet() : getAppNames(contract);
+    private Optional<ServiceContractProto.ServiceContract> getMappingContract(String serviceKey) {
+        GetServiceContractRequest request = new GetServiceContractRequest();
+        request.setName(formatMappingName(serviceKey));
+        request.setService("");
+        request.setVersion("");
+        return getServiceContract(request);
+    }
+
+    private boolean isCurrent(String serviceKey, MappingSubscription subscription) {
+        return !destroyed && mappingSubscriptions.get(serviceKey) == subscription;
+    }
+
+    private void initializeMapping(String serviceKey, MappingSubscription subscription) {
+        try {
+            Optional<ServiceContractProto.ServiceContract> result = getMappingContract(serviceKey);
+            synchronized (mappingLock) {
+                if (isCurrent(serviceKey, subscription)) {
+                    subscription.contract = result.orElse(null);
+                    subscription.task = fetchMappingExecutor.scheduleAtFixedRate(
+                            new FetchMapping(serviceKey, subscription), 5, 5, TimeUnit.SECONDS);
+                }
+                subscription.initialResult.complete(result);
+            }
+        } catch (RuntimeException e) {
+            List<MappingWatch> watches;
+            synchronized (mappingLock) {
+                if (isCurrent(serviceKey, subscription)) {
+                    mappingSubscriptions.remove(serviceKey);
+                }
+                watches = new ArrayList<>(subscription.listeners.values());
+                subscription.initialResult.completeExceptionally(e);
+            }
+            watches.forEach(MappingWatch::deactivate);
+            throw e;
+        }
     }
 
     @Override
     public void destroy() {
+        List<MappingWatch> watches = new ArrayList<>();
+        synchronized (mappingLock) {
+            if (destroyed) {
+                return;
+            }
+            destroyed = true;
+            mappingSubscriptions.values().forEach(subscription -> {
+                watches.addAll(subscription.listeners.values());
+                if (subscription.task != null) {
+                    subscription.task.cancel(false);
+                }
+                subscription.initialResult.complete(Optional.empty());
+            });
+            mappingSubscriptions.clear();
+        }
+        fetchMappingExecutor.shutdownNow();
+        watches.forEach(MappingWatch::deactivate);
         super.destroy();
         another.ifPresent(proxyReport -> proxyReport.getMetadataReport().destroy());
-        fetchMappingExecutor.shutdown();
     }
 
     private String formatCode(Object val) {
         return "POLARIS:" + val;
     }
 
-    private static class FetchMapping implements Runnable {
+    private final class FetchMapping implements Runnable {
 
         private final String serviceKey;
 
-        private final PolarisMetadataReport report;
+        private final MappingSubscription subscription;
 
-        private FetchMapping(String serviceKey, PolarisMetadataReport report) {
+        private FetchMapping(String serviceKey, MappingSubscription subscription) {
             this.serviceKey = serviceKey;
-            this.report = report;
+            this.subscription = subscription;
         }
 
         @Override
         public void run() {
             try {
-                GetServiceContractRequest request = new GetServiceContractRequest();
-                request.setName(formatMappingName(serviceKey));
-                request.setService("");
-                request.setVersion("");
-
-                Optional<ServiceContractProto.ServiceContract> result = report.getServiceContract(request);
-                result.ifPresent(serviceContract -> {
-                    ServiceContractProto.ServiceContract saveData = report.mappingSubscribes.get(serviceKey);
-                    boolean needNotify = false;
-                    // 如果之前就不存在这个 mapping 数据，需要触发通知
-                    if (Objects.isNull(saveData)) {
-                        report.mappingSubscribes.put(serviceKey, serviceContract);
-                        needNotify = true;
+                synchronized (mappingLock) {
+                    if (!isCurrent(serviceKey, subscription)) {
+                        return;
                     }
-                    if (Objects.nonNull(saveData)) {
-                        // 如果 revision 信息比较不一致，则表明出现更细，需要触发通知
-                        if (!Objects.equals(saveData.getRevision(), serviceContract.getRevision())) {
-                            report.mappingSubscribes.put(serviceKey, serviceContract);
-                            needNotify = true;
-                        }
+                }
+                Optional<ServiceContractProto.ServiceContract> result = getMappingContract(serviceKey);
+                List<MappingWatch> listeners;
+                ServiceContractProto.ServiceContract contract;
+                synchronized (mappingLock) {
+                    if (!isCurrent(serviceKey, subscription) || !result.isPresent()) {
+                        return;
                     }
-                    if (needNotify) {
-                        Set<String> newApplications = getAppNames(serviceContract);
-                        report.logger.info(String.format("receive mapping change event, interface=%s applications=%s", serviceKey, newApplications));
-                        Set<MappingListener> listeners = report.mappingListeners.getOrDefault(serviceKey, Collections.emptySet());
-                        MappingChangedEvent event = new MappingChangedEvent(serviceKey, newApplications);
-                        listeners.forEach(mappingListener -> mappingListener.onEvent(event));
+                    contract = result.get();
+                    if (subscription.contract != null && Objects.equals(subscription.contract.getRevision(), contract.getRevision())) {
+                        return;
                     }
-                });
+                    subscription.contract = contract;
+                    listeners = new ArrayList<>(subscription.listeners.values());
+                }
+                MappingChangedEvent event = new MappingChangedEvent(serviceKey, getAppNames(contract));
+                listeners.forEach(listener -> listener.onEvent(event));
             } catch (Throwable e) {
-                report.logger.error(
+                logger.error(
                         "-1",
                         e.getMessage(),
                         serviceKey,
@@ -463,30 +548,112 @@ public class PolarisMetadataReport extends AbstractMetadataReport {
      */
     @Override
     public Set<String> getServiceAppMapping(String serviceKey, MappingListener listener, URL url) {
-        MappingListener multiWatch = new MappingListener() {
-
-            @Override
-            public void onEvent(MappingChangedEvent event) {
-                Set<String> result = commonGetServiceAppMapping(serviceKey, url);
-                another.ifPresent(proxyReport -> result.addAll(proxyReport.getMetadataReport().getServiceAppMapping(serviceKey, url)));
-                event = new MappingChangedEvent(serviceKey, result);
-                listener.onEvent(event);
+        MappingSubscription subscription;
+        MappingWatch watch;
+        boolean initialize = false;
+        synchronized (mappingLock) {
+            if (destroyed) {
+                return Collections.emptySet();
             }
-
-            @Override
-            public void stop() {
-                listener.stop();
+            subscription = mappingSubscriptions.get(serviceKey);
+            if (subscription == null) {
+                subscription = new MappingSubscription();
+                mappingSubscriptions.put(serviceKey, subscription);
+                initialize = true;
             }
-        };
-
-        mappingListeners.computeIfAbsent(serviceKey, s -> new ConcurrentHashSet<>());
-        mappingListeners.get(serviceKey).add(multiWatch);
-        Set<String> result = commonGetServiceAppMapping(serviceKey, url);
-        if (CollectionUtils.isEmpty(result)) {
-            return another.map(proxyReport -> proxyReport.getMetadataReport().getServiceAppMapping(serviceKey, multiWatch, url))
-                    .orElse(Collections.emptySet());
+            watch = subscription.listeners.get(listener);
+            if (watch == null) {
+                watch = new MappingWatch(serviceKey, listener, url, subscription);
+                subscription.listeners.put(listener, watch);
+            }
+        }
+        if (initialize) {
+            initializeMapping(serviceKey, subscription);
+        }
+        subscription.initialResult.join();
+        Set<String> result;
+        synchronized (mappingLock) {
+            if (!isCurrent(serviceKey, subscription) || subscription.listeners.get(listener) != watch) {
+                return Collections.emptySet();
+            }
+            result = subscription.contract == null ? Collections.emptySet() : getAppNames(subscription.contract);
+        }
+        if (result.isEmpty()) {
+            try {
+                return watch.getFallbackMapping();
+            } catch (RuntimeException e) {
+                removeServiceAppMappingListener(serviceKey, listener, watch);
+                throw e;
+            }
         }
         return result;
+    }
+
+    private static class MappingSubscription {
+        private final Map<MappingListener, MappingWatch> listeners = new HashMap<>();
+        private final CompletableFuture<Optional<ServiceContractProto.ServiceContract>> initialResult = new CompletableFuture<>();
+        private ServiceContractProto.ServiceContract contract;
+        private ScheduledFuture<?> task;
+    }
+
+    private final class MappingWatch implements MappingListener {
+        private final String serviceKey;
+        private final MappingListener listener;
+        private final URL url;
+        private final MappingSubscription subscription;
+        private volatile boolean active = true;
+        private boolean fallbackSubscribed;
+
+        private MappingWatch(String serviceKey, MappingListener listener, URL url, MappingSubscription subscription) {
+            this.serviceKey = serviceKey;
+            this.listener = listener;
+            this.url = url;
+            this.subscription = subscription;
+        }
+
+        private synchronized Set<String> getFallbackMapping() {
+            if (!active || !another.isPresent()) {
+                return Collections.emptySet();
+            }
+            if (!fallbackSubscribed) {
+                fallbackSubscribed = true;
+                return another.get().getMetadataReport().getServiceAppMapping(serviceKey, this, url);
+            }
+            return another.get().getMetadataReport().getServiceAppMapping(serviceKey, url);
+        }
+
+        private synchronized void deactivate() {
+            active = false;
+            if (fallbackSubscribed) {
+                fallbackSubscribed = false;
+                another.ifPresent(proxyReport -> proxyReport.getMetadataReport().removeServiceAppMappingListener(serviceKey, this));
+            }
+        }
+
+        @Override
+        public void onEvent(MappingChangedEvent event) {
+            Set<String> result = new HashSet<>(event.getApps());
+            synchronized (mappingLock) {
+                if (!active || !isCurrent(serviceKey, subscription) || subscription.listeners.get(listener) != this) {
+                    return;
+                }
+                if (subscription.contract != null) {
+                    result.addAll(getAppNames(subscription.contract));
+                }
+            }
+            another.ifPresent(proxyReport -> result.addAll(proxyReport.getMetadataReport().getServiceAppMapping(serviceKey, url)));
+            if (active) {
+                listener.onEvent(new MappingChangedEvent(serviceKey, result));
+            }
+        }
+
+        @Override
+        public synchronized void stop() {
+            if (active) {
+                removeServiceAppMappingListener(serviceKey, listener, this);
+                listener.stop();
+            }
+        }
     }
 
     private static String formatMappingName(String key) {
